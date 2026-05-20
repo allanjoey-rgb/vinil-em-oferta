@@ -92,55 +92,62 @@ def buscar_spotify(titulo, artista):
         if not token:
             return None
 
-        query = f"album:{titulo} artist:{artista}" if artista else f"album:{titulo}"
-        resp = requests.get(
-            "https://api.spotify.com/v1/search",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"q": query, "type": "album", "limit": 1, "market": "BR"},
-            timeout=10
-        )
-        if resp.status_code != 200:
-            return None
-
-        items = resp.json().get("albums", {}).get("items", [])
-        if not items:
-            # Tenta busca mais simples
-            resp2 = requests.get(
+        # Busca o álbum específico
+        for query in [
+            f"album:{titulo} artist:{artista}",
+            f"{titulo} {artista}",
+            titulo
+        ]:
+            resp = requests.get(
                 "https://api.spotify.com/v1/search",
                 headers={"Authorization": f"Bearer {token}"},
-                params={"q": f"{titulo} {artista}", "type": "album", "limit": 1, "market": "BR"},
+                params={"q": query, "type": "album", "limit": 1, "market": "BR"},
                 timeout=10
             )
-            items = resp2.json().get("albums", {}).get("items", []) if resp2.status_code == 200 else []
+            if resp.status_code != 200:
+                continue
+            items = resp.json().get("albums", {}).get("items", [])
+            if items:
+                album = items[0]
+                return {
+                    "url": album["external_urls"]["spotify"],
+                    "ano": album.get("release_date", "")[:4],
+                    "nome_album": album.get("name", titulo),
+                    "nome_artista": album["artists"][0]["name"] if album.get("artists") else artista,
+                }
 
-        if not items:
-            return None
-
-        album = items[0]
-        album_id = album["id"]
-        spotify_url = album["external_urls"]["spotify"]
-        ano = album.get("release_date", "")[:4]
-        total_faixas = album.get("total_tracks", 0)
-
-        # Busca faixas populares
-        tracks_resp = requests.get(
-            f"https://api.spotify.com/v1/albums/{album_id}/tracks",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"limit": 5, "market": "BR"},
-            timeout=10
-        )
-        faixas = []
-        if tracks_resp.status_code == 200:
-            faixas = [t["name"] for t in tracks_resp.json().get("items", [])[:3]]
-
-        return {
-            "url": spotify_url,
-            "ano": ano,
-            "total_faixas": total_faixas,
-            "faixas": faixas,
-        }
+        return None
     except Exception as e:
         print(f"  Spotify erro: {e}")
+        return None
+
+# ── Descrição via Claude ──────────────────────────────────────
+
+def gerar_descricao(titulo, artista, ano):
+    try:
+        prompt = (
+            f"Escreva 2 frases curtas e envolventes sobre o álbum '{titulo}' de {artista}"
+            + (f", lançado em {ano}" if ano else "")
+            + ". Destaque algo marcante: contexto histórico, curiosidade, impacto cultural ou por que vale a pena ouvir. "
+            + "Seja direto, sem introdução. Escreva em português brasileiro."
+        )
+
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 150,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=15
+        )
+
+        if resp.status_code == 200:
+            return resp.json()["content"][0]["text"].strip()
+        return None
+    except Exception as e:
+        print(f"  Claude erro: {e}")
         return None
 
 # ── Garimpa Vinil ────────────────────────────────────────────
@@ -159,7 +166,7 @@ def buscar_ids_pagina(pagina):
                 seen.add(disco_id)
                 ids.append(disco_id)
         return ids
-    except Exception as e:
+    except:
         return []
 
 def buscar_dados_disco(disco_id):
@@ -244,7 +251,7 @@ def buscar_ofertas():
 
 # ── Mensagem ─────────────────────────────────────────────────
 
-def formatar_mensagem(oferta, spotify=None):
+def formatar_mensagem(oferta, spotify=None, descricao=None):
     artista = f"👤 {oferta['artista']}" if oferta['artista'] else ""
     preco_atual_fmt = f"R$ {oferta['preco_atual']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     preco_original_fmt = ""
@@ -254,27 +261,25 @@ def formatar_mensagem(oferta, spotify=None):
 
     amazon_link = oferta.get("amazon_link") or oferta.get("link")
 
-    # Bloco Spotify
+    desc_bloco = f"\n\n_{descricao}_" if descricao else ""
+
     spotify_bloco = ""
     if spotify:
-        ano = f" ({spotify['ano']})" if spotify.get('ano') else ""
-        faixas = ""
-        if spotify.get('faixas'):
-            faixas = "\n🎶 *Faixas:* " + " · ".join(spotify['faixas'])
-        spotify_bloco = f"\n{faixas}\n\n[▶️ Ouvir no Spotify]({spotify['url']})"
+        spotify_bloco = f"\n\n[▶️ Ouvir no Spotify]({spotify['url']})"
 
     msg = (
         f"🎵 *{oferta['titulo']}*\n"
-        f"{artista}\n\n"
+        f"{artista}"
+        f"{desc_bloco}\n\n"
         f"🔥 *{oferta['desconto']}% OFF*\n"
         f"💰 {preco_original_fmt}*{preco_atual_fmt}*"
-        f"{spotify_bloco}\n\n"
+        f"{spotify_bloco}\n"
         f"[🛒 Comprar na Amazon]({amazon_link})"
     )
     return msg
 
-def enviar_telegram(oferta, spotify=None):
-    msg = formatar_mensagem(oferta, spotify)
+def enviar_telegram(oferta, spotify=None, descricao=None):
+    msg = formatar_mensagem(oferta, spotify, descricao)
     imagem = oferta.get("imagem")
 
     if imagem:
@@ -297,7 +302,9 @@ def executar():
     enviados = 0
     for oferta in ofertas:
         spotify = buscar_spotify(oferta['titulo'], oferta['artista'])
-        sucesso = enviar_telegram(oferta, spotify)
+        ano = spotify['ano'] if spotify else ""
+        descricao = gerar_descricao(oferta['titulo'], oferta['artista'], ano)
+        sucesso = enviar_telegram(oferta, spotify, descricao)
         if sucesso:
             marcar_enviado(oferta["id"], oferta["titulo"], oferta["preco_atual"], oferta["desconto"])
             enviados += 1
