@@ -5,16 +5,21 @@ import re
 import schedule
 from datetime import datetime
 from bs4 import BeautifulSoup
+import base64
 
 # ============================================================
 TELEGRAM_TOKEN = "8510903032:AAFWAM2Wgx9Nle2ZwUyngfICorai_U7WVf0"
 TELEGRAM_CHANNEL = "@vinilemoferta"
 DESCONTO_MINIMO = 20
-MAX_DISCOS = 30
+MAX_DISCOS = 50
+SPOTIFY_CLIENT_ID = "a71df3a013bc4e13bc802d9085937a28"
+SPOTIFY_CLIENT_SECRET = "cc903c8455884f45b9aa2a3b0f1ad8e3"
 # ============================================================
 
 DB_FILE = "ofertas.db"
 BASE_URL = "https://www.garimpavinil.com.br"
+spotify_token = None
+spotify_token_expires = 0
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -61,6 +66,85 @@ def to_float(s):
     except:
         return None
 
+# ── Spotify ──────────────────────────────────────────────────
+
+def get_spotify_token():
+    global spotify_token, spotify_token_expires
+    if spotify_token and time.time() < spotify_token_expires:
+        return spotify_token
+    creds = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
+    resp = requests.post(
+        "https://accounts.spotify.com/api/token",
+        headers={"Authorization": f"Basic {creds}"},
+        data={"grant_type": "client_credentials"},
+        timeout=10
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        spotify_token = data["access_token"]
+        spotify_token_expires = time.time() + data["expires_in"] - 60
+        return spotify_token
+    return None
+
+def buscar_spotify(titulo, artista):
+    try:
+        token = get_spotify_token()
+        if not token:
+            return None
+
+        query = f"album:{titulo} artist:{artista}" if artista else f"album:{titulo}"
+        resp = requests.get(
+            "https://api.spotify.com/v1/search",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"q": query, "type": "album", "limit": 1, "market": "BR"},
+            timeout=10
+        )
+        if resp.status_code != 200:
+            return None
+
+        items = resp.json().get("albums", {}).get("items", [])
+        if not items:
+            # Tenta busca mais simples
+            resp2 = requests.get(
+                "https://api.spotify.com/v1/search",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"q": f"{titulo} {artista}", "type": "album", "limit": 1, "market": "BR"},
+                timeout=10
+            )
+            items = resp2.json().get("albums", {}).get("items", []) if resp2.status_code == 200 else []
+
+        if not items:
+            return None
+
+        album = items[0]
+        album_id = album["id"]
+        spotify_url = album["external_urls"]["spotify"]
+        ano = album.get("release_date", "")[:4]
+        total_faixas = album.get("total_tracks", 0)
+
+        # Busca faixas populares
+        tracks_resp = requests.get(
+            f"https://api.spotify.com/v1/albums/{album_id}/tracks",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"limit": 5, "market": "BR"},
+            timeout=10
+        )
+        faixas = []
+        if tracks_resp.status_code == 200:
+            faixas = [t["name"] for t in tracks_resp.json().get("items", [])[:3]]
+
+        return {
+            "url": spotify_url,
+            "ano": ano,
+            "total_faixas": total_faixas,
+            "faixas": faixas,
+        }
+    except Exception as e:
+        print(f"  Spotify erro: {e}")
+        return None
+
+# ── Garimpa Vinil ────────────────────────────────────────────
+
 def buscar_ids_pagina(pagina):
     url = f"{BASE_URL}/disco?page={pagina}"
     try:
@@ -76,7 +160,6 @@ def buscar_ids_pagina(pagina):
                 ids.append(disco_id)
         return ids
     except Exception as e:
-        print(f"  Erro página {pagina}: {e}")
         return []
 
 def buscar_dados_disco(disco_id):
@@ -89,7 +172,6 @@ def buscar_dados_disco(disco_id):
         soup = BeautifulSoup(resp.text, "html.parser")
         texto = soup.get_text(" ")
 
-        # Desconto — aparece como "↓ 35.5%" na página individual
         match_d = re.search(r'↓\s*([\d.]+)%', texto)
         if not match_d:
             return None
@@ -97,32 +179,24 @@ def buscar_dados_disco(disco_id):
         if desconto < DESCONTO_MINIMO:
             return None
 
-        # Título — h1
         h1 = soup.find("h1")
         titulo = h1.get_text(strip=True) if h1 else disco_id
 
-        # Artista — primeiro link de artista
         artista_link = soup.find("a", href=re.compile(r'/artista/'))
         artista = artista_link.get_text(strip=True) if artista_link else ""
 
-        # Preço atual — primeiro "R$ X" após o título
         precos = re.findall(r'R\$\s*([\d.,]+)', texto)
         preco_atual = to_float(precos[0]) if precos else None
-        preco_original = None
 
-        # Preço original — busca "Média: R$ X"
         match_media = re.search(r'Média:\s*R\$\s*([\d.,]+)', texto)
-        if match_media:
-            preco_original = to_float(match_media.group(1))
+        preco_original = to_float(match_media.group(1)) if match_media else None
 
         if not preco_atual:
             return None
 
-        # Imagem
         img = soup.find("img", src=re.compile(r'media-amazon'))
         img_url = img.get("src") if img else None
 
-        # Link Amazon
         amazon = soup.find("a", href=re.compile(r'amazon\.com\.br/dp/'))
         amazon_link = amazon.get("href") if amazon else url
 
@@ -137,8 +211,7 @@ def buscar_dados_disco(disco_id):
             "amazon_link": amazon_link,
             "imagem": img_url,
         }
-
-    except Exception as e:
+    except:
         return None
 
 def buscar_ofertas():
@@ -169,27 +242,39 @@ def buscar_ofertas():
     ofertas.sort(key=lambda x: x["desconto"], reverse=True)
     return ofertas
 
-def formatar_mensagem(oferta):
-    artista = f"👤 {oferta['artista']}\n" if oferta['artista'] else ""
+# ── Mensagem ─────────────────────────────────────────────────
+
+def formatar_mensagem(oferta, spotify=None):
+    artista = f"👤 {oferta['artista']}" if oferta['artista'] else ""
     preco_atual_fmt = f"R$ {oferta['preco_atual']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     preco_original_fmt = ""
     if oferta.get('preco_original'):
         p = f"R$ {oferta['preco_original']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        preco_original_fmt = f"~{p}~\n"
+        preco_original_fmt = f"~{p}~ → "
 
-    link = oferta.get("amazon_link") or oferta.get("link")
+    amazon_link = oferta.get("amazon_link") or oferta.get("link")
+
+    # Bloco Spotify
+    spotify_bloco = ""
+    if spotify:
+        ano = f" ({spotify['ano']})" if spotify.get('ano') else ""
+        faixas = ""
+        if spotify.get('faixas'):
+            faixas = "\n🎶 *Faixas:* " + " · ".join(spotify['faixas'])
+        spotify_bloco = f"\n{faixas}\n\n[▶️ Ouvir no Spotify]({spotify['url']})"
+
     msg = (
         f"🎵 *{oferta['titulo']}*\n"
-        f"{artista}\n"
+        f"{artista}\n\n"
         f"🔥 *{oferta['desconto']}% OFF*\n"
-        f"{preco_original_fmt}"
-        f"💰 *{preco_atual_fmt}*\n\n"
-        f"[🛒 Ver oferta]({link})"
+        f"💰 {preco_original_fmt}*{preco_atual_fmt}*"
+        f"{spotify_bloco}\n\n"
+        f"[🛒 Comprar na Amazon]({amazon_link})"
     )
     return msg
 
-def enviar_telegram(oferta):
-    msg = formatar_mensagem(oferta)
+def enviar_telegram(oferta, spotify=None):
+    msg = formatar_mensagem(oferta, spotify)
     imagem = oferta.get("imagem")
 
     if imagem:
@@ -211,7 +296,8 @@ def executar():
 
     enviados = 0
     for oferta in ofertas:
-        sucesso = enviar_telegram(oferta)
+        spotify = buscar_spotify(oferta['titulo'], oferta['artista'])
+        sucesso = enviar_telegram(oferta, spotify)
         if sucesso:
             marcar_enviado(oferta["id"], oferta["titulo"], oferta["preco_atual"], oferta["desconto"])
             enviados += 1
@@ -224,11 +310,11 @@ if __name__ == "__main__":
     print("🎵 Vinil em Oferta — Bot iniciado")
     print(f"   Desconto mínimo: {DESCONTO_MINIMO}%")
     print(f"   Canal: {TELEGRAM_CHANNEL}")
-    print(f"   Agendado: a cada 20 minutos\n")
+    print(f"   Agendado: a cada 3 horas\n")
 
     executar()
 
-    schedule.every(20).minutes.do(executar)
+    schedule.every(3).hours.do(executar)
     while True:
         schedule.run_pending()
         time.sleep(60)
