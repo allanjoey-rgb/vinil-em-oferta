@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 TELEGRAM_TOKEN = "8510903032:AAFWAM2Wgx9Nle2ZwUyngfICorai_U7WVf0"
 TELEGRAM_CHANNEL = "@vinilemoferta"
 DESCONTO_MINIMO = 20
-PAGINAS = 5
+MAX_DISCOS = 30
 # ============================================================
 
 DB_FILE = "ofertas.db"
@@ -55,107 +55,193 @@ def marcar_enviado(disco_id, titulo, preco, desconto):
     conn.commit()
     conn.close()
 
-def parse_preco(texto):
+def buscar_ids_sitemap():
+    """Busca IDs de discos pelo sitemap XML — sem JavaScript"""
+    url = f"{BASE_URL}/sitemap"
+    ids = []
     try:
-        limpo = texto.replace("R$", "").replace("\xa0", "").strip()
-        limpo = limpo.replace(".", "").replace(",", ".")
-        return float(limpo)
-    except:
-        return None
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        print(f"  Sitemap: status {resp.status_code}, tamanho {len(resp.text)} chars")
+        
+        # Tenta XML
+        soup = BeautifulSoup(resp.text, "xml")
+        locs = soup.find_all("loc")
+        print(f"  Sitemap XML: {len(locs)} URLs encontradas")
+        
+        for loc in locs:
+            href = loc.get_text(strip=True)
+            if "/disco/" in href:
+                disco_id = href.split("/disco/")[-1].strip("/")
+                if disco_id:
+                    ids.append(disco_id)
+    except Exception as e:
+        print(f"  Erro sitemap: {e}")
+    
+    print(f"  Total IDs do sitemap: {len(ids)}")
+    return ids
 
-def buscar_ofertas():
-    ofertas = []
-
-    for pagina in range(1, PAGINAS + 1):
-        url = f"{BASE_URL}/disco?page={pagina}"
+def buscar_dados_disco(disco_id):
+    """Busca dados de um disco específico pela página JSON do Next.js"""
+    # Tenta endpoint JSON do Next.js
+    urls_tentar = [
+        f"{BASE_URL}/disco/{disco_id}",
+    ]
+    
+    for url in urls_tentar:
         try:
             resp = requests.get(url, headers=HEADERS, timeout=15)
             if resp.status_code != 200:
-                print(f"  Página {pagina}: erro {resp.status_code}")
                 continue
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            texto_pagina = resp.text
-
-            # Debug: mostra trecho do HTML pra entender estrutura
-            if pagina == 1:
-                # Procura qualquer menção a desconto
-                matches = re.findall(r'.{50}-\d+%.{50}', texto_pagina)
-                print(f"  Exemplos de desconto no HTML: {matches[:2]}")
-                
-                # Procura preços
-                precos = re.findall(r'R\$\s*[\d.,]+', texto_pagina)
-                print(f"  Exemplos de preço: {precos[:4]}")
-
-            # Tenta extrair blocos por âncora de disco
-            # Cada disco tem um link /disco/SLUG e dados próximos
-            blocos = re.findall(
-                r'href="(/disco/([^"]+))"[^}]*?(-\d+%)[^}]*?(R\$[\s\d.,]+)[^}]*?(R\$[\s\d.,]+)',
-                texto_pagina
-            )
-            print(f"  Página {pagina}: {len(blocos)} blocos encontrados via regex")
-
-            for bloco in blocos:
-                href, disco_id, desconto_str, preco1_str, preco2_str = bloco
+            
+            html = resp.text
+            
+            # Procura dados no __NEXT_DATA__ (JSON embutido no HTML pelo Next.js)
+            match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+            if match:
+                import json
                 try:
-                    desconto = int(desconto_str.replace("-", "").replace("%", ""))
-                    if desconto < DESCONTO_MINIMO:
-                        continue
-                    if ja_enviado(disco_id):
-                        continue
-
-                    preco_original = parse_preco(preco1_str)
-                    preco_atual = parse_preco(preco2_str)
-
-                    if not preco_atual:
-                        continue
-
-                    # Busca título e artista próximos ao href no HTML
-                    idx = texto_pagina.find(f'href="{href}"')
-                    trecho = texto_pagina[idx:idx+800] if idx >= 0 else ""
+                    data = json.loads(match.group(1))
+                    props = data.get("props", {}).get("pageProps", {})
                     
-                    titulo_match = re.search(r'<h2[^>]*>([^<]+)</h2>', trecho)
-                    titulo = titulo_match.group(1).strip() if titulo_match else disco_id
-
-                    artista_match = re.search(r'<p[^>]*>([^<]{2,60})</p>', trecho)
-                    artista = artista_match.group(1).strip() if artista_match else ""
-
-                    img_match = re.search(r'src="(https://m\.media-amazon[^"]+)"', trecho)
-                    img_url = img_match.group(1) if img_match else None
-
-                    amazon_match = re.search(r'href="(https://www\.amazon\.com\.br[^"]+)"', trecho)
-                    amazon_link = amazon_match.group(1) if amazon_match else f"{BASE_URL}{href}"
-
-                    ofertas.append({
-                        "id": disco_id,
-                        "titulo": titulo,
-                        "artista": artista,
-                        "preco_original": preco_original,
-                        "preco_atual": preco_atual,
-                        "desconto": desconto,
-                        "link": f"{BASE_URL}{href}",
-                        "amazon_link": amazon_link,
-                        "imagem": img_url,
-                    })
-                except Exception as e:
-                    continue
-
-            time.sleep(1)
-
+                    disco = props.get("disco") or props.get("product") or props.get("album") or {}
+                    
+                    print(f"  Next data keys: {list(props.keys())}")
+                    
+                    # Tenta extrair campos
+                    titulo = disco.get("title") or disco.get("titulo") or disco.get("name") or ""
+                    artista = disco.get("artist") or disco.get("artista") or disco.get("author") or ""
+                    preco_atual = disco.get("price") or disco.get("preco") or disco.get("currentPrice") or 0
+                    preco_original = disco.get("originalPrice") or disco.get("precoOriginal") or 0
+                    desconto = disco.get("discount") or disco.get("desconto") or 0
+                    img_url = disco.get("image") or disco.get("imagem") or disco.get("thumbnail") or ""
+                    amazon_link = disco.get("amazonUrl") or disco.get("link") or disco.get("url") or ""
+                    
+                    if not titulo:
+                        # Fallback: extrai do HTML
+                        soup = BeautifulSoup(html, "html.parser")
+                        h1 = soup.find("h1")
+                        titulo = h1.get_text(strip=True) if h1 else disco_id
+                    
+                    if desconto >= DESCONTO_MINIMO and preco_atual:
+                        return {
+                            "id": disco_id,
+                            "titulo": titulo,
+                            "artista": artista,
+                            "preco_original": float(preco_original) if preco_original else None,
+                            "preco_atual": float(preco_atual),
+                            "desconto": int(desconto),
+                            "link": url,
+                            "amazon_link": amazon_link,
+                            "imagem": img_url,
+                        }
+                    elif titulo:
+                        # Tem dados mas sem desconto suficiente
+                        return None
+                        
+                except json.JSONDecodeError:
+                    pass
+            
+            # Fallback: parse HTML direto
+            soup = BeautifulSoup(html, "html.parser")
+            texto = soup.get_text(" ")
+            
+            # Desconto
+            match_d = re.search(r'-(\d+)%', texto)
+            if not match_d:
+                return None
+            desconto = int(match_d.group(1))
+            if desconto < DESCONTO_MINIMO:
+                return None
+            
+            # Preços
+            precos = re.findall(r'R\$\s*([\d]+[.,][\d]+)', texto)
+            if len(precos) < 2:
+                return None
+            
+            def to_float(s):
+                return float(s.replace(".", "").replace(",", "."))
+            
+            preco_original = to_float(precos[0])
+            preco_atual = to_float(precos[1])
+            
+            # Título
+            h1 = soup.find("h1")
+            titulo = h1.get_text(strip=True) if h1 else disco_id
+            
+            # Artista
+            artista = ""
+            for p in soup.find_all("p"):
+                t = p.get_text(strip=True)
+                if t and 2 < len(t) < 60 and "R$" not in t and "%" not in t:
+                    artista = t
+                    break
+            
+            # Imagem
+            img = soup.find("img", src=re.compile(r'amazon|media'))
+            img_url = img.get("src") if img else None
+            
+            # Amazon link
+            amazon = soup.find("a", href=re.compile(r'amazon\.com\.br'))
+            amazon_link = amazon.get("href") if amazon else url
+            
+            return {
+                "id": disco_id,
+                "titulo": titulo,
+                "artista": artista,
+                "preco_original": preco_original,
+                "preco_atual": preco_atual,
+                "desconto": desconto,
+                "link": url,
+                "amazon_link": amazon_link,
+                "imagem": img_url,
+            }
+            
         except Exception as e:
-            print(f"  Erro na página {pagina}: {e}")
+            print(f"  Erro em {url}: {e}")
+    
+    return None
 
-    # Deduplica e ordena
+def buscar_ofertas():
+    # Busca IDs pelo sitemap
+    ids = buscar_ids_sitemap()
+    
+    if not ids:
+        print("  Sitemap vazio, usando fallback por paginação")
+        ids = []
+        for pagina in range(1, 6):
+            url = f"{BASE_URL}/disco?page={pagina}"
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=15)
+                soup = BeautifulSoup(resp.text, "html.parser")
+                links = soup.find_all("a", href=re.compile(r'^/disco/[^/]+$'))
+                for l in links:
+                    disco_id = l["href"].replace("/disco/", "").strip("/")
+                    if disco_id:
+                        ids.append(disco_id)
+                time.sleep(1)
+            except:
+                pass
+    
+    # Filtra já enviados
+    ids_novos = []
     seen = set()
-    unicas = []
-    for o in ofertas:
-        if o["id"] not in seen:
-            seen.add(o["id"])
-            unicas.append(o)
-
-    unicas.sort(key=lambda x: x["desconto"], reverse=True)
-    print(f"  Total de ofertas novas: {len(unicas)}")
-    return unicas
+    for disco_id in ids:
+        if disco_id not in seen and not ja_enviado(disco_id):
+            seen.add(disco_id)
+            ids_novos.append(disco_id)
+    
+    print(f"  {len(ids_novos)} discos novos para verificar (max {MAX_DISCOS})")
+    
+    ofertas = []
+    for disco_id in ids_novos[:MAX_DISCOS]:
+        dados = buscar_dados_disco(disco_id)
+        if dados:
+            ofertas.append(dados)
+            print(f"  ✓ {dados['titulo']} ({dados['desconto']}% OFF - R${dados['preco_atual']})")
+        time.sleep(1.5)
+    
+    ofertas.sort(key=lambda x: x["desconto"], reverse=True)
+    return ofertas
 
 def formatar_mensagem(oferta):
     artista = f"👤 {oferta['artista']}\n" if oferta['artista'] else ""
