@@ -1,12 +1,11 @@
 import requests
 import sqlite3
 import time
+import re
 import schedule
 from datetime import datetime
 from bs4 import BeautifulSoup
 
-# ============================================================
-# CONFIGURAÇÕES
 # ============================================================
 TELEGRAM_TOKEN = "8510903032:AAFWAM2Wgx9Nle2ZwUyngfICorai_U7WVf0"
 TELEGRAM_CHANNEL = "@vinilemoferta"
@@ -58,120 +57,133 @@ def marcar_enviado(disco_id, titulo, preco, desconto):
 
 def parse_preco(texto):
     try:
-        return float(texto.replace("R$", "").replace(".", "").replace(",", ".").strip())
+        limpo = re.sub(r'[^\d,]', '', texto.replace(".", ""))
+        return float(limpo.replace(",", "."))
     except:
         return None
 
+def buscar_ids_pagina(pagina):
+    url = f"{BASE_URL}/disco?page={pagina}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        links = soup.find_all("a", href=re.compile(r'^/disco/[^/]+$'))
+        ids = []
+        for l in links:
+            href = l.get("href", "")
+            disco_id = href.replace("/disco/", "").strip("/")
+            if disco_id and disco_id not in ids:
+                ids.append(disco_id)
+        return ids
+    except Exception as e:
+        print(f"  Erro na página {pagina}: {e}")
+        return []
+
+def buscar_dados_disco(disco_id):
+    url = f"{BASE_URL}/disco/{disco_id}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        texto = soup.get_text(" ")
+
+        # Desconto
+        match = re.search(r'-(\d+)%', texto)
+        if not match:
+            return None
+        desconto = int(match.group(1))
+        if desconto < DESCONTO_MINIMO:
+            return None
+
+        # Título
+        titulo_el = soup.find(["h1", "h2"])
+        titulo = titulo_el.get_text(strip=True) if titulo_el else disco_id
+
+        # Artista
+        artista = ""
+        ps = soup.find_all("p")
+        for p in ps:
+            t = p.get_text(strip=True)
+            if t and len(t) < 80 and "R$" not in t:
+                artista = t
+                break
+
+        # Preços
+        precos = re.findall(r'R\$\s*[\d.,]+', texto)
+        preco_original = parse_preco(precos[0]) if len(precos) > 0 else None
+        preco_atual = parse_preco(precos[1]) if len(precos) > 1 else None
+        if not preco_atual:
+            preco_atual = preco_original
+
+        # Imagem
+        img = soup.find("img", src=re.compile(r'amazon'))
+        img_url = img.get("src") if img else None
+
+        # Link Amazon
+        amazon = soup.find("a", href=re.compile(r'amazon\.com\.br'))
+        amazon_link = amazon.get("href") if amazon else url
+
+        return {
+            "id": disco_id,
+            "titulo": titulo,
+            "artista": artista,
+            "preco_original": preco_original,
+            "preco_atual": preco_atual,
+            "desconto": desconto,
+            "link": url,
+            "amazon_link": amazon_link,
+            "imagem": img_url,
+        }
+    except Exception as e:
+        return None
+
 def buscar_ofertas():
-    ofertas = []
-
+    todos_ids = []
     for pagina in range(1, PAGINAS + 1):
-        url = f"{BASE_URL}/disco?page={pagina}"
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=15)
-            print(f"  Página {pagina}: status {resp.status_code}")
-            if resp.status_code != 200:
-                continue
+        ids = buscar_ids_pagina(pagina)
+        print(f"  Página {pagina}: {len(ids)} discos")
+        todos_ids.extend(ids)
+        time.sleep(1)
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Busca todos os links de disco
-            links = soup.find_all("a", href=True)
-            disco_links = [l for l in links if "/disco/" in l.get("href", "") and l.get("href", "").count("/") >= 2]
-
-            print(f"  Página {pagina}: {len(disco_links)} links de disco encontrados")
-
-            for card in disco_links:
-                try:
-                    href = card.get("href", "")
-                    disco_id = href.split("/disco/")[-1].strip("/")
-                    if not disco_id or ja_enviado(disco_id):
-                        continue
-
-                    texto_completo = card.get_text(" ", strip=True)
-
-                    # Desconto
-                    desconto = None
-                    import re
-                    match = re.search(r'-(\d+)%', texto_completo)
-                    if match:
-                        desconto = int(match.group(1))
-                    if not desconto or desconto < DESCONTO_MINIMO:
-                        continue
-
-                    # Título
-                    titulo_el = card.find(["h2", "h3", "h4"])
-                    titulo = titulo_el.get_text(strip=True) if titulo_el else "Sem título"
-
-                    # Artista
-                    paragrafos = card.find_all("p")
-                    artista = paragrafos[0].get_text(strip=True) if paragrafos else ""
-
-                    # Preços
-                    precos_texto = re.findall(r'R\$\s*[\d.,]+', texto_completo)
-                    preco_original = parse_preco(precos_texto[0]) if len(precos_texto) > 0 else None
-                    preco_atual = parse_preco(precos_texto[1]) if len(precos_texto) > 1 else None
-
-                    # Imagem
-                    img = card.find("img")
-                    img_url = img.get("src") if img else None
-
-                    # Link Amazon
-                    amazon_links = card.find_all("a", href=lambda h: h and "amazon.com.br" in h)
-                    amazon_link = amazon_links[0]["href"] if amazon_links else None
-
-                    if titulo and preco_atual:
-                        ofertas.append({
-                            "id": disco_id,
-                            "titulo": titulo,
-                            "artista": artista,
-                            "preco_original": preco_original,
-                            "preco_atual": preco_atual,
-                            "desconto": desconto,
-                            "link": f"{BASE_URL}{href}",
-                            "amazon_link": amazon_link,
-                            "imagem": img_url,
-                        })
-
-                except Exception as e:
-                    continue
-
-            time.sleep(2)
-
-        except Exception as e:
-            print(f"  Erro na página {pagina}: {e}")
-
-    # Deduplica e ordena
+    # Remove duplicatas e já enviados
+    ids_novos = []
     seen = set()
-    unicas = []
-    for o in ofertas:
-        if o["id"] not in seen:
-            seen.add(o["id"])
-            unicas.append(o)
+    for disco_id in todos_ids:
+        if disco_id not in seen and not ja_enviado(disco_id):
+            seen.add(disco_id)
+            ids_novos.append(disco_id)
 
-    unicas.sort(key=lambda x: x["desconto"], reverse=True)
-    print(f"  Total de ofertas novas: {len(unicas)}")
-    return unicas
+    print(f"  {len(ids_novos)} discos novos para verificar")
+
+    ofertas = []
+    for disco_id in ids_novos[:30]:  # limite de 30 por rodada
+        dados = buscar_dados_disco(disco_id)
+        if dados:
+            ofertas.append(dados)
+            print(f"  ✓ {dados['titulo']} ({dados['desconto']}% OFF)")
+        time.sleep(1)
+
+    ofertas.sort(key=lambda x: x["desconto"], reverse=True)
+    return ofertas
 
 def formatar_mensagem(oferta):
     artista = f"👤 {oferta['artista']}\n" if oferta['artista'] else ""
-    
     preco_atual_fmt = f"R$ {oferta['preco_atual']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    
     preco_original_fmt = ""
-    if oferta.get('preco_original'):
-        preco_original_fmt = f"~R$ {oferta['preco_original']:,.2f}~\n".replace(",", "X").replace(".", ",").replace("X", ".")
+    if oferta.get('preco_original') and oferta['preco_original'] != oferta['preco_atual']:
+        p = f"R$ {oferta['preco_original']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        preco_original_fmt = f"~{p}~\n"
 
     link = oferta.get("amazon_link") or oferta.get("link")
-
     msg = (
         f"🎵 *{oferta['titulo']}*\n"
-        f"{artista}"
-        f"\n"
+        f"{artista}\n"
         f"🔥 *{oferta['desconto']}% OFF*\n"
         f"{preco_original_fmt}"
-        f"💰 *{preco_atual_fmt}*\n"
-        f"\n"
+        f"💰 *{preco_atual_fmt}*\n\n"
         f"[🛒 Ver oferta]({link})"
     )
     return msg
@@ -182,19 +194,10 @@ def enviar_telegram(oferta):
 
     if imagem:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-        payload = {
-            "chat_id": TELEGRAM_CHANNEL,
-            "photo": imagem,
-            "caption": msg,
-            "parse_mode": "Markdown"
-        }
+        payload = {"chat_id": TELEGRAM_CHANNEL, "photo": imagem, "caption": msg, "parse_mode": "Markdown"}
     else:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHANNEL,
-            "text": msg,
-            "parse_mode": "Markdown"
-        }
+        payload = {"chat_id": TELEGRAM_CHANNEL, "text": msg, "parse_mode": "Markdown"}
 
     resp = requests.post(url, json=payload, timeout=10)
     if resp.status_code != 200:
@@ -204,6 +207,7 @@ def enviar_telegram(oferta):
 def executar():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Buscando ofertas...")
     ofertas = buscar_ofertas()
+    print(f"  {len(ofertas)} oferta(s) com desconto >= {DESCONTO_MINIMO}%")
 
     enviados = 0
     for oferta in ofertas:
@@ -211,10 +215,7 @@ def executar():
         if sucesso:
             marcar_enviado(oferta["id"], oferta["titulo"], oferta["preco_atual"], oferta["desconto"])
             enviados += 1
-            print(f"  ✓ {oferta['titulo']} ({oferta['desconto']}% OFF)")
             time.sleep(3)
-        else:
-            print(f"  ✗ Falha: {oferta['titulo']}")
 
     print(f"  Total enviado: {enviados}")
 
