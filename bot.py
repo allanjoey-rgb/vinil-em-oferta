@@ -1,21 +1,27 @@
 import requests
 import sqlite3
-import json
 import time
 import schedule
 from datetime import datetime
+from bs4 import BeautifulSoup
 
 # ============================================================
-# CONFIGURAÇÕES — edite aqui
+# CONFIGURAÇÕES
 # ============================================================
 TELEGRAM_TOKEN = "8510903032:AAFWAM2Wgx9Nle2ZwUyngfICorai_U7WVf0"
 TELEGRAM_CHANNEL = "@vinilemoferta"
-DESCONTO_MINIMO = 20  # % mínimo de desconto
-PAGINAS = 5           # quantas páginas do Garimpa Vinil buscar
+DESCONTO_MINIMO = 20
+PAGINAS = 5
 # ============================================================
 
 DB_FILE = "ofertas.db"
 BASE_URL = "https://www.garimpavinil.com.br"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "pt-BR,pt;q=0.9",
+}
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -50,75 +56,71 @@ def marcar_enviado(disco_id, titulo, preco, desconto):
     conn.commit()
     conn.close()
 
+def parse_preco(texto):
+    try:
+        return float(texto.replace("R$", "").replace(".", "").replace(",", ".").strip())
+    except:
+        return None
+
 def buscar_ofertas():
     ofertas = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
 
     for pagina in range(1, PAGINAS + 1):
         url = f"{BASE_URL}/disco?page={pagina}"
         try:
-            resp = requests.get(url, headers=headers, timeout=10)
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            print(f"  Página {pagina}: status {resp.status_code}")
             if resp.status_code != 200:
-                print(f"Erro na página {pagina}: status {resp.status_code}")
                 continue
 
-            from bs4 import BeautifulSoup
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Busca cards de disco
-            cards = soup.find_all("a", href=lambda h: h and "/disco/" in h)
+            # Busca todos os links de disco
+            links = soup.find_all("a", href=True)
+            disco_links = [l for l in links if "/disco/" in l.get("href", "") and l.get("href", "").count("/") >= 2]
 
-            for card in cards:
+            print(f"  Página {pagina}: {len(disco_links)} links de disco encontrados")
+
+            for card in disco_links:
                 try:
-                    # Desconto
-                    badge = card.find(string=lambda t: t and "%" in t)
-                    if not badge:
+                    href = card.get("href", "")
+                    disco_id = href.split("/disco/")[-1].strip("/")
+                    if not disco_id or ja_enviado(disco_id):
                         continue
-                    desconto_str = badge.strip().replace("-", "").replace("%", "")
-                    desconto = int(desconto_str)
-                    if desconto < DESCONTO_MINIMO:
+
+                    texto_completo = card.get_text(" ", strip=True)
+
+                    # Desconto
+                    desconto = None
+                    import re
+                    match = re.search(r'-(\d+)%', texto_completo)
+                    if match:
+                        desconto = int(match.group(1))
+                    if not desconto or desconto < DESCONTO_MINIMO:
                         continue
 
                     # Título
-                    titulo_el = card.find("h2") or card.find("h3")
+                    titulo_el = card.find(["h2", "h3", "h4"])
                     titulo = titulo_el.get_text(strip=True) if titulo_el else "Sem título"
 
                     # Artista
-                    artista_els = card.find_all("p")
-                    artista = artista_els[0].get_text(strip=True) if artista_els else ""
+                    paragrafos = card.find_all("p")
+                    artista = paragrafos[0].get_text(strip=True) if paragrafos else ""
 
                     # Preços
-                    precos = card.find_all(string=lambda t: t and "R$" in t)
-                    preco_original = None
-                    preco_atual = None
-                    for p in precos:
-                        val = p.strip().replace("R$", "").replace(".", "").replace(",", ".").strip()
-                        try:
-                            val_float = float(val)
-                            if preco_original is None:
-                                preco_original = val_float
-                            else:
-                                preco_atual = val_float
-                                break
-                        except:
-                            continue
-
-                    # Link Amazon
-                    amazon_link = None
-                    amazon_tag = card.find("a", href=lambda h: h and "amazon.com.br" in h)
-                    if amazon_tag:
-                        amazon_link = amazon_tag["href"]
-
-                    # ID único baseado no href
-                    disco_id = card["href"].split("/disco/")[-1].strip("/")
+                    precos_texto = re.findall(r'R\$\s*[\d.,]+', texto_completo)
+                    preco_original = parse_preco(precos_texto[0]) if len(precos_texto) > 0 else None
+                    preco_atual = parse_preco(precos_texto[1]) if len(precos_texto) > 1 else None
 
                     # Imagem
                     img = card.find("img")
-                    img_url = img["src"] if img and img.get("src") else None
+                    img_url = img.get("src") if img else None
 
-                    if preco_atual and not ja_enviado(disco_id):
+                    # Link Amazon
+                    amazon_links = card.find_all("a", href=lambda h: h and "amazon.com.br" in h)
+                    amazon_link = amazon_links[0]["href"] if amazon_links else None
+
+                    if titulo and preco_atual:
                         ofertas.append({
                             "id": disco_id,
                             "titulo": titulo,
@@ -126,19 +128,20 @@ def buscar_ofertas():
                             "preco_original": preco_original,
                             "preco_atual": preco_atual,
                             "desconto": desconto,
-                            "link": f"{BASE_URL}{card['href']}",
+                            "link": f"{BASE_URL}{href}",
                             "amazon_link": amazon_link,
                             "imagem": img_url,
                         })
+
                 except Exception as e:
                     continue
 
-            time.sleep(1)  # respeita o servidor
+            time.sleep(2)
 
         except Exception as e:
-            print(f"Erro ao buscar página {pagina}: {e}")
+            print(f"  Erro na página {pagina}: {e}")
 
-    # Remove duplicatas por ID
+    # Deduplica e ordena
     seen = set()
     unicas = []
     for o in ofertas:
@@ -146,14 +149,18 @@ def buscar_ofertas():
             seen.add(o["id"])
             unicas.append(o)
 
-    # Ordena por maior desconto
     unicas.sort(key=lambda x: x["desconto"], reverse=True)
+    print(f"  Total de ofertas novas: {len(unicas)}")
     return unicas
 
 def formatar_mensagem(oferta):
     artista = f"👤 {oferta['artista']}\n" if oferta['artista'] else ""
-    preco_original = f"~~R$ {oferta['preco_original']:,.2f}~~".replace(",", "X").replace(".", ",").replace("X", ".") if oferta['preco_original'] else ""
-    preco_atual = f"R$ {oferta['preco_atual']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    
+    preco_atual_fmt = f"R$ {oferta['preco_atual']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    
+    preco_original_fmt = ""
+    if oferta.get('preco_original'):
+        preco_original_fmt = f"~R$ {oferta['preco_original']:,.2f}~\n".replace(",", "X").replace(".", ",").replace("X", ".")
 
     link = oferta.get("amazon_link") or oferta.get("link")
 
@@ -162,10 +169,10 @@ def formatar_mensagem(oferta):
         f"{artista}"
         f"\n"
         f"🔥 *{oferta['desconto']}% OFF*\n"
-        f"{preco_original}\n"
-        f"💰 *{preco_atual}*\n"
+        f"{preco_original_fmt}"
+        f"💰 *{preco_atual_fmt}*\n"
         f"\n"
-        f"[🛒 Ver na Amazon]({link})"
+        f"[🛒 Ver oferta]({link})"
     )
     return msg
 
@@ -186,17 +193,17 @@ def enviar_telegram(oferta):
         payload = {
             "chat_id": TELEGRAM_CHANNEL,
             "text": msg,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": False
+            "parse_mode": "Markdown"
         }
 
     resp = requests.post(url, json=payload, timeout=10)
+    if resp.status_code != 200:
+        print(f"  Telegram erro: {resp.text}")
     return resp.status_code == 200
 
 def executar():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Buscando ofertas...")
     ofertas = buscar_ofertas()
-    print(f"  {len(ofertas)} oferta(s) nova(s) encontrada(s)")
 
     enviados = 0
     for oferta in ofertas:
@@ -204,10 +211,10 @@ def executar():
         if sucesso:
             marcar_enviado(oferta["id"], oferta["titulo"], oferta["preco_atual"], oferta["desconto"])
             enviados += 1
-            print(f"  ✓ Enviado: {oferta['titulo']} ({oferta['desconto']}% OFF)")
-            time.sleep(3)  # pausa entre mensagens
+            print(f"  ✓ {oferta['titulo']} ({oferta['desconto']}% OFF)")
+            time.sleep(3)
         else:
-            print(f"  ✗ Falha ao enviar: {oferta['titulo']}")
+            print(f"  ✗ Falha: {oferta['titulo']}")
 
     print(f"  Total enviado: {enviados}")
 
@@ -216,13 +223,11 @@ if __name__ == "__main__":
     print("🎵 Vinil em Oferta — Bot iniciado")
     print(f"   Desconto mínimo: {DESCONTO_MINIMO}%")
     print(f"   Canal: {TELEGRAM_CHANNEL}")
-    print(f"   Agendado: a cada 4 horas\n")
+    print(f"   Agendado: a cada 20 minutos\n")
 
-    # Roda imediatamente na primeira vez
     executar()
 
-    # Agenda a cada 4 horas
-    schedule.every(4).hours.do(executar)
+    schedule.every(20).minutes.do(executar)
     while True:
         schedule.run_pending()
         time.sleep(60)
