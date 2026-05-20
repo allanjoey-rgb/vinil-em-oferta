@@ -8,12 +8,14 @@ from bs4 import BeautifulSoup
 import base64
 
 # ============================================================
-TELEGRAM_TOKEN = "8510903032:AAFWAM2Wgx9Nle2ZwUyngfICorai_U7WVf0"
+import os
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8510903032:AAFWAM2Wgx9Nle2ZwUyngfICorai_U7WVf0")
 TELEGRAM_CHANNEL = "@vinilemoferta"
-DESCONTO_MINIMO = 20
+DESCONTO_MINIMO = 25
 MAX_DISCOS = 50
-SPOTIFY_CLIENT_ID = "a71df3a013bc4e13bc802d9085937a28"
-SPOTIFY_CLIENT_SECRET = "cc903c8455884f45b9aa2a3b0f1ad8e3"
+SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "a71df3a013bc4e13bc802d9085937a28")
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "cc903c8455884f45b9aa2a3b0f1ad8e3")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 # ============================================================
 
 DB_FILE = "ofertas.db"
@@ -134,9 +136,13 @@ def gerar_descricao(titulo, artista, ano):
 
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 150,
                 "messages": [{"role": "user", "content": prompt}]
             },
