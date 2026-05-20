@@ -318,12 +318,31 @@ def executar():
 
     print(f"  Total enviado: {enviados}")
 
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'Vinil em Oferta - Bot rodando!')
+    def log_message(self, format, *args):
+        pass
+
+def iniciar_servidor():
+    port = int(os.environ.get('PORT', 8080))
+    server = HTTPServer(('0.0.0.0', port), Handler)
+    server.serve_forever()
+
 if __name__ == "__main__":
     init_db()
     print("🎵 Vinil em Oferta — Bot iniciado")
     print(f"   Desconto mínimo: {DESCONTO_MINIMO}%")
     print(f"   Canal: {TELEGRAM_CHANNEL}")
     print(f"   Agendado: a cada 3 horas\n")
+
+    t = threading.Thread(target=iniciar_servidor, daemon=True)
+    t.start()
 
     executar()
 
