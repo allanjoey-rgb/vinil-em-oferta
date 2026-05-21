@@ -119,35 +119,66 @@ def get_spotify_token():
         return spotify_token
     return None
 
+def limpar_titulo(titulo):
+    """Remove sufixos de edição que atrapalham a busca"""
+    import re
+    titulo = re.sub(r'\[.*?\]', '', titulo)  # Remove [LP], [2LP], [Disco de Vinil] etc
+    titulo = re.sub(r'\(.*?\)', '', titulo)  # Remove (Remaster), (Edition) etc
+    titulo = titulo.strip()
+    return titulo
+
 def buscar_spotify(titulo, artista):
     try:
         token = get_spotify_token()
         if not token:
             return None
 
-        # Busca o álbum específico
-        for query in [
-            f"album:{titulo} artist:{artista}",
-            f"{titulo} {artista}",
-            titulo
-        ]:
+        titulo_limpo = limpar_titulo(titulo)
+        artista_limpo = artista.strip()
+
+        queries = []
+        if artista_limpo:
+            queries.append(f"album:{titulo_limpo} artist:{artista_limpo}")
+            queries.append(f"{titulo_limpo} {artista_limpo}")
+        queries.append(titulo_limpo)
+
+        for query in queries:
             resp = requests.get(
                 "https://api.spotify.com/v1/search",
                 headers={"Authorization": f"Bearer {token}"},
-                params={"q": query, "type": "album", "limit": 1, "market": "BR"},
+                params={"q": query, "type": "album", "limit": 5, "market": "BR"},
                 timeout=10
             )
             if resp.status_code != 200:
                 continue
             items = resp.json().get("albums", {}).get("items", [])
-            if items:
-                album = items[0]
-                return {
-                    "url": album["external_urls"]["spotify"],
-                    "ano": album.get("release_date", "")[:4],
-                    "nome_album": album.get("name", titulo),
-                    "nome_artista": album["artists"][0]["name"] if album.get("artists") else artista,
-                }
+            if not items:
+                continue
+
+            # Tenta encontrar o melhor match pelo nome do artista
+            for album in items:
+                album_artista = album["artists"][0]["name"].lower() if album.get("artists") else ""
+                album_nome = album.get("name", "").lower()
+                titulo_lower = titulo_limpo.lower()
+                artista_lower = artista_limpo.lower()
+
+                # Match exato de artista ou título similar
+                if (artista_lower and artista_lower in album_artista) or                    (artista_lower and album_artista in artista_lower) or                    titulo_lower in album_nome:
+                    return {
+                        "url": album["external_urls"]["spotify"],
+                        "ano": album.get("release_date", "")[:4],
+                        "nome_album": album.get("name", titulo),
+                        "nome_artista": album["artists"][0]["name"] if album.get("artists") else artista,
+                    }
+
+            # Fallback: primeiro resultado
+            album = items[0]
+            return {
+                "url": album["external_urls"]["spotify"],
+                "ano": album.get("release_date", "")[:4],
+                "nome_album": album.get("name", titulo),
+                "nome_artista": album["artists"][0]["name"] if album.get("artists") else artista,
+            }
 
         return None
     except Exception as e:
@@ -335,13 +366,32 @@ def formatar_mensagem(oferta, spotify=None, descricao=None):
     if spotify:
         spotify_bloco = f"\n\n[▶️ Ouvir no Spotify]({spotify['url']})"
 
-    # Chamada pra ação baseada no desconto
+    # Chamada pra ação baseada no desconto — varia a cada post
+    import random as _rnd
     if oferta['desconto'] >= 40:
-        cta = "⚡ Desconto raro — corre antes que suba!"
+        cta = _rnd.choice([
+            "⚡ Desconto raro — corre antes que suba!",
+            "🚨 Esse preço não dura. Aproveita agora!",
+            "🔥 Um dos maiores descontos que vimos nesse disco.",
+            "⏳ Histórico mostra que sobe rápido. Não deixa passar.",
+            "💥 Oferta fora do comum. Sério.",
+        ])
     elif oferta['desconto'] >= 30:
-        cta = "👉 Boa janela pra comprar, aproveita!"
+        cta = _rnd.choice([
+            "👉 Preço bem abaixo da média. Vale muito.",
+            "🎯 Boa hora pra adicionar esse à coleção.",
+            "📉 Caiu bastante. Momento certo pra comprar.",
+            "🛒 Desconto consistente — tá valendo sim.",
+            "✅ Preço histórico bom. Não precisa esperar mais.",
+        ])
     else:
-        cta = "🎯 Preço abaixo da média histórica."
+        cta = _rnd.choice([
+            "🎯 Preço abaixo da média histórica.",
+            "💡 Tá com desconto. Vale conferir.",
+            "📊 Desconto real, não é fumaça.",
+            "👀 Melhor preço dos últimos tempos.",
+            "🎵 Bom momento pra garantir esse.",
+        ])
 
     msg = (
         f"🎵 *{oferta['titulo']}*\n"
@@ -352,7 +402,7 @@ def formatar_mensagem(oferta, spotify=None, descricao=None):
         f"{spotify_bloco}\n"
         f"[🛒 Comprar na Amazon]({amazon_link})\n\n"
         f"{cta}\n"
-        f"📲 @groovesemfim"
+        f"📲 [instagram.com/groovesemfim](https://instagram.com/groovesemfim)"
     )
     return msg
 
