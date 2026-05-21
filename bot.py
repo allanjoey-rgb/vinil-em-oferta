@@ -6,16 +6,18 @@ import schedule
 from datetime import datetime
 from bs4 import BeautifulSoup
 import base64
+import random
 
 # ============================================================
 import os
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8510903032:AAFWAM2Wgx9Nle2ZwUyngfICorai_U7WVf0")
 TELEGRAM_CHANNEL = "@vinilemoferta"
-DESCONTO_MINIMO = 25
-MAX_DISCOS = 50
+DESCONTO_MINIMO = 20
+MAX_DISCOS = 20
 SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "a71df3a013bc4e13bc802d9085937a28")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "cc903c8455884f45b9aa2a3b0f1ad8e3")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ESTILOS = ["rock", "jazz", "pop", "classical", "hip-hop", "blues", "electronic", "soul", "folk", "samba", "mpb"]
 # ============================================================
 
 DB_FILE = "ofertas.db"
@@ -41,13 +43,42 @@ def init_db():
             enviado_em TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS config (
+            chave TEXT PRIMARY KEY,
+            valor TEXT
+        )
+    """)
+    c.execute("INSERT OR IGNORE INTO config VALUES ('rodada', '0')")
     conn.commit()
     conn.close()
+
+def get_rodada():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT valor FROM config WHERE chave = 'rodada'")
+    result = c.fetchone()
+    conn.close()
+    return int(result[0]) if result else 0
+
+def avancar_rodada():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    rodada_atual = get_rodada()
+    nova_rodada = (rodada_atual + 1) % 3
+    c.execute("UPDATE config SET valor = ? WHERE chave = 'rodada'", (str(nova_rodada),))
+    conn.commit()
+    conn.close()
+    return nova_rodada
 
 def ja_enviado(disco_id):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id FROM enviados WHERE id = ?", (disco_id,))
+    # Bloqueia por 7 dias — depois pode aparecer de novo se ainda estiver em oferta
+    c.execute("""
+        SELECT id FROM enviados 
+        WHERE id = ? AND enviado_em > datetime('now', '-2 days')
+    """, (disco_id,))
     result = c.fetchone()
     conn.close()
     return result is not None
@@ -158,10 +189,11 @@ def gerar_descricao(titulo, artista, ano):
 
 # ── Garimpa Vinil ────────────────────────────────────────────
 
-def buscar_ids_pagina(pagina):
-    url = f"{BASE_URL}/disco?page={pagina}"
+def buscar_ids_url(url):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return []
         soup = BeautifulSoup(resp.text, "html.parser")
         links = soup.find_all("a", href=re.compile(r'^/disco/[^/]+$'))
         ids = []
@@ -174,6 +206,9 @@ def buscar_ids_pagina(pagina):
         return ids
     except:
         return []
+
+def buscar_ids_pagina(pagina):
+    return buscar_ids_url(f"{BASE_URL}/disco?page={pagina}")
 
 def buscar_dados_disco(disco_id):
     url = f"{BASE_URL}/disco/{disco_id}"
@@ -212,6 +247,9 @@ def buscar_dados_disco(disco_id):
 
         amazon = soup.find("a", href=re.compile(r'amazon\.com\.br/dp/'))
         amazon_link = amazon.get("href") if amazon else url
+        if amazon_link and "amazon.com.br" in amazon_link:
+            sep = "&" if "?" in amazon_link else "?"
+            amazon_link = f"{amazon_link}{sep}tag=groovesemfim-20"
 
         return {
             "id": disco_id,
@@ -229,9 +267,19 @@ def buscar_dados_disco(disco_id):
 
 def buscar_ofertas():
     todos_ids = []
-    for pagina in range(1, 6):
-        ids = buscar_ids_pagina(pagina)
-        print(f"  Página {pagina}: {len(ids)} discos")
+    
+    # Fonte principal: artistas mais ouvidos
+    ids_mais_ouvidos = buscar_ids_url(f"{BASE_URL}/artistas-mais-ouvidos")
+    print(f"  Mais ouvidos: {len(ids_mais_ouvidos)} discos")
+    todos_ids.extend(ids_mais_ouvidos)
+    time.sleep(1)
+    
+    # Complementa com estilos rotacionados
+    rodada = get_rodada()
+    estilos_rodada = ESTILOS[rodada % len(ESTILOS):] + ESTILOS[:rodada % len(ESTILOS)]
+    for estilo in estilos_rodada[:2]:
+        ids = buscar_ids_url(f"{BASE_URL}/estilo/{estilo}?page=1")
+        print(f"  Estilo {estilo}: {len(ids)} discos")
         todos_ids.extend(ids)
         time.sleep(1)
 
@@ -252,7 +300,21 @@ def buscar_ofertas():
             print(f"  ✓ {dados['titulo']} ({dados['desconto']}% OFF)")
         time.sleep(1.5)
 
-    ofertas.sort(key=lambda x: x["desconto"], reverse=True)
+    rodada = get_rodada()
+    
+    if rodada == 0:
+        # Maior desconto
+        print(f"  Estratégia: maior desconto")
+        ofertas.sort(key=lambda x: x["desconto"], reverse=True)
+    elif rodada == 1:
+        # Menor preço
+        print(f"  Estratégia: menor preço")
+        ofertas.sort(key=lambda x: x["preco_atual"])
+    else:
+        # Aleatório
+        print(f"  Estratégia: aleatório")
+        random.shuffle(ofertas)
+    
     return ofertas
 
 # ── Mensagem ─────────────────────────────────────────────────
@@ -273,6 +335,14 @@ def formatar_mensagem(oferta, spotify=None, descricao=None):
     if spotify:
         spotify_bloco = f"\n\n[▶️ Ouvir no Spotify]({spotify['url']})"
 
+    # Chamada pra ação baseada no desconto
+    if oferta['desconto'] >= 40:
+        cta = "⚡ Desconto raro — corre antes que suba!"
+    elif oferta['desconto'] >= 30:
+        cta = "👉 Boa janela pra comprar, aproveita!"
+    else:
+        cta = "🎯 Preço abaixo da média histórica."
+
     msg = (
         f"🎵 *{oferta['titulo']}*\n"
         f"{artista}"
@@ -280,7 +350,9 @@ def formatar_mensagem(oferta, spotify=None, descricao=None):
         f"🔥 *{oferta['desconto']}% OFF*\n"
         f"💰 {preco_original_fmt}*{preco_atual_fmt}*"
         f"{spotify_bloco}\n"
-        f"[🛒 Comprar na Amazon]({amazon_link})"
+        f"[🛒 Comprar na Amazon]({amazon_link})\n\n"
+        f"{cta}\n"
+        f"📲 @groovesemfim"
     )
     return msg
 
@@ -316,6 +388,7 @@ def executar():
             enviados += 1
             time.sleep(3)
 
+    avancar_rodada()
     print(f"  Total enviado: {enviados}")
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
