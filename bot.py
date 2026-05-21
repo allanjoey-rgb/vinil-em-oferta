@@ -296,10 +296,95 @@ def buscar_dados_disco(disco_id):
     except:
         return None
 
+def buscar_umusic():
+    """Busca ofertas na Universal Music Store"""
+    ofertas = []
+    url = "https://www.umusicstore.com/lp---vinil/vinil-ate-50--off---frete-fixo?map=category-2,productclusternames&order=OrderByBestDiscountDESC"
+    
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            print(f"  UMusic: erro {resp.status_code}")
+            return []
+        
+        soup = BeautifulSoup(resp.text, "html.parser")
+        texto = resp.text
+        
+        # Extrai produtos via regex do HTML
+        import re as _re
+        # Padrão: título, artista, preço original, preço atual, desconto, link
+        produtos = _re.findall(
+            r'href="(https://www\.umusicstore\.com/[^"]+/p)"[^>]*>.*?'
+            r'R\$\s*([\d.,]+).*?R\$\s*([\d.,]+).*?(\d+)%\s*OFF',
+            texto, _re.DOTALL
+        )
+        
+        print(f"  UMusic: {len(produtos)} produtos encontrados")
+        
+        seen = set()
+        for produto in produtos:
+            try:
+                link, preco_orig_str, preco_atual_str, desconto_str = produto
+                desconto = int(desconto_str)
+                if desconto < DESCONTO_MINIMO:
+                    continue
+                
+                # ID único baseado no link
+                disco_id = "umusic_" + link.split("/")[-2]
+                if disco_id in seen or ja_enviado(disco_id):
+                    continue
+                seen.add(disco_id)
+                
+                preco_original = float(preco_orig_str.replace(".", "").replace(",", "."))
+                preco_atual = float(preco_atual_str.replace(".", "").replace(",", "."))
+                
+                # Busca título e artista pelo contexto no HTML
+                idx = texto.find(link)
+                trecho = texto[max(0, idx-500):idx+200]
+                
+                # Título — geralmente "Vinil Artista - Album"
+                titulo_match = _re.search(r'Vinil\s+([^<"]+?)\s*(?:R\$|$)', trecho)
+                titulo_raw = titulo_match.group(1).strip() if titulo_match else disco_id
+                
+                # Separa artista e título
+                partes = titulo_raw.split(" - ", 1)
+                artista = partes[0].replace("Vinil ", "").strip() if len(partes) > 1 else ""
+                titulo = partes[1].strip() if len(partes) > 1 else titulo_raw
+                
+                # Remove sufixos como (LP), (2LP), - Importado, - Nacional
+                titulo = _re.sub(r'\s*[\(\[][^\)\]]+[\)\]]', '', titulo).strip()
+                titulo = _re.sub(r'\s*-\s*(Importado|Nacional|LP|2LP).*$', '', titulo).strip()
+                
+                # Imagem
+                img_match = _re.search(r'src="(https://universalmusic\.vtexassets\.com[^"]+)"', trecho)
+                img_url = img_match.group(1) if img_match else None
+                
+                # Link com afiliado (sem afiliado Amazon pois é loja própria)
+                amazon_link = link
+                
+                ofertas.append({
+                    "id": disco_id,
+                    "titulo": titulo,
+                    "artista": artista,
+                    "preco_original": preco_original,
+                    "preco_atual": preco_atual,
+                    "desconto": desconto,
+                    "link": link,
+                    "amazon_link": link,
+                    "imagem": img_url,
+                    "fonte": "UMusic"
+                })
+            except Exception as e:
+                continue
+    except Exception as e:
+        print(f"  UMusic erro: {e}")
+    
+    return ofertas
+
 def buscar_ofertas():
     todos_ids = []
     
-    # Fonte principal: artistas mais ouvidos
+    # Fonte 1: artistas mais ouvidos (Garimpa Vinil)
     ids_mais_ouvidos = buscar_ids_url(f"{BASE_URL}/artistas-mais-ouvidos")
     print(f"  Mais ouvidos: {len(ids_mais_ouvidos)} discos")
     todos_ids.extend(ids_mais_ouvidos)
@@ -313,6 +398,10 @@ def buscar_ofertas():
         print(f"  Estilo {estilo}: {len(ids)} discos")
         todos_ids.extend(ids)
         time.sleep(1)
+    
+    # Fonte 2: Universal Music Store
+    ofertas_umusic = buscar_umusic()
+    print(f"  UMusic: {len(ofertas_umusic)} ofertas com desconto")
 
     ids_novos = []
     seen = set()
@@ -324,12 +413,18 @@ def buscar_ofertas():
     print(f"  {len(ids_novos)} discos novos — verificando {min(len(ids_novos), MAX_DISCOS)}")
 
     ofertas = []
+    # Garimpa Vinil
     for disco_id in ids_novos[:MAX_DISCOS]:
         dados = buscar_dados_disco(disco_id)
         if dados:
             ofertas.append(dados)
             print(f"  ✓ {dados['titulo']} ({dados['desconto']}% OFF)")
         time.sleep(1.5)
+    
+    # Universal Music Store — adiciona as que cabem no limite
+    slots_restantes = MAX_DISCOS - len(ofertas)
+    if slots_restantes > 0:
+        ofertas.extend(ofertas_umusic[:slots_restantes])
 
     rodada = get_rodada()
     
@@ -400,7 +495,7 @@ def formatar_mensagem(oferta, spotify=None, descricao=None):
         f"🔥 *{oferta['desconto']}% OFF*\n"
         f"💰 {preco_original_fmt}*{preco_atual_fmt}*"
         f"{spotify_bloco}\n"
-        f"[🛒 Comprar na Amazon]({amazon_link})\n\n"
+        f"[🛒 {'Comprar na Universal Music' if oferta.get('fonte') == 'UMusic' else 'Comprar na Amazon'}]({amazon_link})\n\n"
         f"{cta}\n"
         f"📲 [instagram.com/groovesemfim](https://instagram.com/groovesemfim)"
     )
